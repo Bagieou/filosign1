@@ -1,5 +1,4 @@
 name: iOS Deep Compiler Validation
-
 on:
   push:
     branches: [ main, master ]
@@ -9,8 +8,7 @@ on:
 jobs:
   validate-ios-framework:
     name: Flutter iOS Diagnostic Check
-    runs-on: macos-26
-
+    runs-on: macos-14 # Updated to a widely standard macOS runner image
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -38,6 +36,16 @@ jobs:
             echo "iOS directory or Podfile missing. Re-generating scaffolding..."
             flutter create --platforms ios .
           fi
+
+      - name: Inject iOS Camera Permissions
+        run: |
+          INFOPLIST="ios/Runner/Info.plist"
+          echo "Injecting privacy strings into $INFOPLIST..."
+          # Plutil seamlessly modifies the Info.plist XML safely without risking regex bugs
+          plutil -insert NSCameraUsageDescription -string "This app requires camera access to capture photos and scan codes." "$INFOPLIST" || true
+          plutil -insert NSMicrophoneUsageDescription -string "This app requires microphone access to record videos." "$INFOPLIST" || true
+          echo "--- Verified Info.plist Permissions ---"
+          plutil -p "$INFOPLIST" | grep -E "UsageDescription"
 
       - name: Ensure platform line in Podfile
         run: |
