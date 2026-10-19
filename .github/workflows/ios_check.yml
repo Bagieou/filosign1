@@ -8,7 +8,7 @@ on:
 jobs:
   validate-ios-framework:
     name: Flutter iOS Diagnostic Check
-    runs-on: macos-14 # Updated to a widely standard macOS runner image
+    runs-on: macos-14
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -37,27 +37,71 @@ jobs:
             flutter create --platforms ios .
           fi
 
-      - name: Inject iOS Camera Permissions
+      - name: Inject iOS Camera Permissions (Info.plist)
         run: |
           INFOPLIST="ios/Runner/Info.plist"
           echo "Injecting privacy strings into $INFOPLIST..."
-          # Plutil seamlessly modifies the Info.plist XML safely without risking regex bugs
-          plutil -insert NSCameraUsageDescription -string "This app requires camera access to capture photos and scan codes." "$INFOPLIST" || true
-          plutil -insert NSMicrophoneUsageDescription -string "This app requires microphone access to record videos." "$INFOPLIST" || true
+          # -replace creates the key if missing and overwrites it if present
+          plutil -replace NSCameraUsageDescription -string "This app requires camera access to capture photos and scan codes." "$INFOPLIST"
+          plutil -replace NSMicrophoneUsageDescription -string "This app requires microphone access to record videos." "$INFOPLIST"
+          plutil -replace NSPhotoLibraryUsageDescription -string "This app requires library access to save or upload assets." "$INFOPLIST"
+          plutil -replace NSPhotoLibraryAddUsageDescription -string "This app requires permission to save photos and videos to your library." "$INFOPLIST"
+          plutil -lint "$INFOPLIST"
           echo "--- Verified Info.plist Permissions ---"
           plutil -p "$INFOPLIST" | grep -E "UsageDescription"
 
-      - name: Ensure platform line in Podfile
+      - name: Configure Podfile Platform & Camera Macro Triggers
         run: |
+          # 1. Ensure target platform is set
           if ! grep -qE "^[[:space:]]*platform[[:space:]]+:ios" ios/Podfile; then
             echo "Inserting 'platform :ios, 15.0' into ios/Podfile"
             { echo "platform :ios, '15.0'"; cat ios/Podfile; } > /tmp/Podfile.new
             mv /tmp/Podfile.new ios/Podfile
-          else
-            echo "platform :ios already present in ios/Podfile"
           fi
-          echo "--- ios/Podfile (first 20 lines) ---"
-          head -20 ios/Podfile
+
+          # 2. Add permission macros INSIDE the existing post_install hook
+          #    (CocoaPods does not support multiple post_install hooks)
+          python3 - <<'PY'
+          import re
+          path = 'ios/Podfile'
+          src = open(path).read()
+
+          if 'PERMISSION_CAMERA=1' in src:
+              print('Macros already present, skipping')
+              raise SystemExit(0)
+
+          block = """
+              target.build_configurations.each do |config|
+                config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+                config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= ['$(inherited)']
+                config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] += [
+                  'PERMISSION_CAMERA=1',
+                  'PERMISSION_PHOTOS=1',
+                  'PERMISSION_MICROPHONE=1',
+                ]
+              end
+          """
+
+          pattern = r'(^[ \t]*flutter_additional_ios_build_settings\(target\)[ \t]*\n)'
+          if re.search(pattern, src, re.M):
+              src = re.sub(pattern, lambda m: m.group(1) + block, src, count=1, flags=re.M)
+          else:
+              src += """
+          post_install do |installer|
+            installer.pods_project.targets.each do |target|
+              flutter_additional_ios_build_settings(target)
+          """ + block + """
+            end
+          end
+          """
+          open(path, 'w').write(src)
+          print('Podfile patched')
+          PY
+
+          echo "--- post_install hook count (must be 1) ---"
+          grep -c "post_install do" ios/Podfile
+          echo "--- ios/Podfile (Tail View) ---"
+          tail -35 ios/Podfile
 
       - name: Pin iOS deployment target in Xcode project
         run: |
@@ -110,6 +154,15 @@ jobs:
 
       - name: Build iOS (unsigned)
         run: flutter build ios --release --no-codesign --no-pub
+
+      - name: Verify camera permissions in built app
+        run: |
+          APP_PLIST="build/ios/iphoneos/Runner.app/Info.plist"
+          plutil -p "$APP_PLIST" | grep -E "UsageDescription"
+          if ! plutil -p "$APP_PLIST" | grep -q NSCameraUsageDescription; then
+            echo "NSCameraUsageDescription missing from built app"
+            exit 1
+          fi
 
       - name: Manually Package App Payload
         run: |
